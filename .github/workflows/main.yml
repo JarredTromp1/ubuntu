@@ -160,7 +160,8 @@ jobs:
           echo "::add-mask::$TS_AUTHKEY"
 
           KEYFILE="$(mktemp)"
-          trap 'shred -u "$KEYFILE" 2>/dev/null || rm -f "$KEYFILE"; unset TS_AUTHKEY' EXIT
+          # The key file becomes root-owned below, so cleanup needs sudo (/tmp is sticky).
+          trap 'sudo shred -u "$KEYFILE" 2>/dev/null || sudo rm -f "$KEYFILE"; unset TS_AUTHKEY' EXIT
           chmod 600 "$KEYFILE"
           printf '%s' "$TS_AUTHKEY" | tr -d '[:space:]' > "$KEYFILE"
 
