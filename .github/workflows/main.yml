@@ -121,10 +121,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Drop inbound 22 and 3389 on every interface except tailscale0 (and loopback).
+          # Allow inbound 22 and 3389 only on tailscale0 (and loopback); drop everywhere else.
+          # iptables allows only one -i per rule, so: DROP first, then insert ACCEPTs above it.
           for ipt in iptables ip6tables; do
             for port in 22 3389; do
-              sudo $ipt -I INPUT 1 -p tcp --dport $port ! -i tailscale0 ! -i lo -j DROP
+              sudo $ipt -I INPUT 1 -p tcp --dport $port -j DROP
+              sudo $ipt -I INPUT 1 -p tcp --dport $port -i tailscale0 -j ACCEPT
+              sudo $ipt -I INPUT 1 -p tcp --dport $port -i lo -j ACCEPT
             done
           done
           sudo iptables -S INPUT | head -n 10
