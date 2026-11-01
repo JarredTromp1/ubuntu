@@ -1,0 +1,285 @@
+name: SSH (Ubuntu + optional GUI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How many hours should the session run?"
+        required: true
+        default: "2"
+        type: choice
+        options: ["1", "2", "3", "4", "5"]
+      enable_gui:
+        description: "Also install XFCE + xrdp (GUI over RDP via Tailscale)? Adds ~3-5 min."
+        required: true
+        default: true
+        type: boolean
+      allow_ssh_password:
+        description: "Also allow SSH password login (in addition to your key)? Tailscale-only either way."
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  secure-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      SESSION_HOURS: ${{ inputs.hours }}
+      ENABLE_GUI: ${{ inputs.enable_gui }}
+      ALLOW_SSH_PASSWORD: ${{ inputs.allow_ssh_password }}
+      REMOTE_USER: remote
+
+    steps:
+      - name: Set Runtime Deadline
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$SESSION_HOURS" =~ ^[1-5]$ ]]; then
+            echo "Runtime must be between 1 and 5 hours." >&2
+            exit 1
+          fi
+          STOP_EPOCH=$(date -u -d "+${SESSION_HOURS} hours" +%s)
+          echo "SESSION_STOP_EPOCH=$STOP_EPOCH" >> "$GITHUB_ENV"
+          echo "Runtime: ${SESSION_HOURS} hour(s)"
+          echo "Deadline UTC: $(date -u -d @"$STOP_EPOCH" '+%Y-%m-%d %H:%M:%S')"
+
+      - name: Create Remote Admin User (key + password)
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "RDP_PASSWORD secret is missing or shorter than 12 characters." >&2
+            exit 1
+          fi
+          echo "::add-mask::$RDP_PASSWORD"
+          if [ -z "${SSH_PUBLIC_KEY// /}" ]; then
+            echo "SSH_PUBLIC_KEY secret is missing." >&2
+            exit 1
+          fi
+          # Basic sanity check that it looks like a public key, not a private one.
+          case "$SSH_PUBLIC_KEY" in
+            ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-*) ;;
+            *) echo "SSH_PUBLIC_KEY does not look like a public key (expected ssh-ed25519 ...)." >&2; exit 1 ;;
+          esac
+
+          if ! id "$REMOTE_USER" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash -G sudo "$REMOTE_USER"
+          fi
+          # Real password: used for sudo (admin) and the xrdp login screen.
+          # 'sudo' group membership gives admin rights; sudo will ask for this password.
+          echo "$REMOTE_USER:$RDP_PASSWORD" | sudo chpasswd
+          unset RDP_PASSWORD
+
+          sudo install -d -m 700 -o "$REMOTE_USER" -g "$REMOTE_USER" "/home/$REMOTE_USER/.ssh"
+          printf '%s\n' "$SSH_PUBLIC_KEY" | sudo tee "/home/$REMOTE_USER/.ssh/authorized_keys" >/dev/null
+          sudo chown "$REMOTE_USER:$REMOTE_USER" "/home/$REMOTE_USER/.ssh/authorized_keys"
+          sudo chmod 600 "/home/$REMOTE_USER/.ssh/authorized_keys"
+          echo "User '$REMOTE_USER' configured."
+
+      - name: Configure and Harden OpenSSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server tmux
+
+          if [ "$ALLOW_SSH_PASSWORD" = "true" ]; then PW_AUTH=yes; else PW_AUTH=no; fi
+
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          # 00- prefix so these win over any later drop-in (first value wins in sshd).
+          # Keepalives: dead connections are cleaned up after ~10 min (30s x 20) of no reply,
+          # and idle-but-alive connections are never dropped. A new connection always works.
+          sudo tee /etc/ssh/sshd_config.d/00-hardening.conf >/dev/null <<EOF
+          PasswordAuthentication $PW_AUTH
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          PubkeyAuthentication yes
+          AllowUsers $REMOTE_USER
+          MaxAuthTries 4
+          MaxSessions 20
+          MaxStartups 20:30:60
+          LoginGraceTime 60
+          TCPKeepAlive yes
+          ClientAliveInterval 30
+          ClientAliveCountMax 20
+          EOF
+
+          sudo sshd -t
+          sudo systemctl enable ssh >/dev/null 2>&1 || true
+          sudo systemctl restart ssh
+          sudo systemctl is-active ssh
+          echo "OpenSSH configured."
+
+      - name: Firewall - allow SSH/RDP only via Tailscale
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Drop inbound 22 and 3389 on every interface except tailscale0 (and loopback).
+          for ipt in iptables ip6tables; do
+            for port in 22 3389; do
+              sudo $ipt -I INPUT 1 -p tcp --dport $port ! -i tailscale0 ! -i lo -j DROP
+            done
+          done
+          sudo iptables -S INPUT | head -n 10
+          echo "Firewall rules applied."
+
+      - name: Install Tailscale (official apt repo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CODENAME="$(lsb_release -cs)"
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.noarmor.gpg" \
+            | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.tailscale-keyring.list" \
+            | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y tailscale
+          sudo systemctl enable --now tailscaled
+          tailscale version
+
+      - name: Establish Tailscale Connection
+        shell: bash
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TS_AUTHKEY// /}" ]; then
+            echo "TAILSCALE_AUTH_KEY secret is missing or empty." >&2
+            exit 1
+          fi
+          echo "::add-mask::$TS_AUTHKEY"
+
+          KEYFILE="$(mktemp)"
+          trap 'shred -u "$KEYFILE" 2>/dev/null || rm -f "$KEYFILE"; unset TS_AUTHKEY' EXIT
+          chmod 600 "$KEYFILE"
+          printf '%s' "$TS_AUTHKEY" | tr -d '[:space:]' > "$KEYFILE"
+
+          # tailscaled runs as root, so give it read access to the temp key file.
+          sudo chown root:root "$KEYFILE"
+
+          # --accept-dns=false keeps the runner's own DNS untouched.
+          sudo tailscale up \
+            --auth-key="file:$KEYFILE" \
+            --hostname="gh-runner-${GITHUB_RUN_ID}" \
+            --accept-dns=false \
+            --timeout=60s >/dev/null 2>&1 \
+            || { echo "Tailscale connection failed. Check the auth key is valid, unexpired, reusable and pre-approved." >&2; exit 1; }
+
+          TS_IP=""
+          for i in $(seq 1 12); do
+            TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+            [ -n "$TS_IP" ] && break
+            sleep 5
+          done
+          [ -n "$TS_IP" ] || { echo "Tailscale IP was not assigned." >&2; exit 1; }
+
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale connected. IP: $TS_IP"
+
+      # ---------------- Optional GUI (only when enable_gui = true) ----------------
+      - name: Install XFCE + xrdp (optional GUI)
+        if: ${{ inputs.enable_gui }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-terminal dbus-x11 xorgxrdp xrdp
+
+          # Keep disconnected desktop sessions alive so you can reconnect to the same session.
+          sudo sed -i \
+            -e 's/^#\?KillDisconnected=.*/KillDisconnected=false/' \
+            -e 's/^#\?DisconnectedTimeLimit=.*/DisconnectedTimeLimit=0/' \
+            -e 's/^#\?IdleTimeLimit=.*/IdleTimeLimit=0/' \
+            /etc/xrdp/sesman.ini
+
+          echo "xfce4-session" | sudo tee "/home/$REMOTE_USER/.xsession" >/dev/null
+          sudo chown "$REMOTE_USER:$REMOTE_USER" "/home/$REMOTE_USER/.xsession"
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+
+          sudo systemctl enable --now xrdp
+          sleep 3
+          sudo ss -ltn | grep -q ':3389 ' || { echo "xrdp is not listening on 3389." >&2; exit 1; }
+          echo "GUI ready (xrdp on 3389, reachable only via Tailscale)."
+
+      - name: Preinstall uBlock Origin policies (optional GUI)
+        if: ${{ inputs.enable_gui }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Chrome: classic uBO is gone from the Web Store (MV2), so use uBlock Origin Lite (MV3).
+          sudo mkdir -p /etc/opt/chrome/policies/managed
+          sudo tee /etc/opt/chrome/policies/managed/ublock.json >/dev/null <<'EOF'
+          { "ExtensionInstallForcelist": ["ddkjiahejlhfcafbddmgiahcphecmpfh;https://clients2.google.com/service/update2/crx"] }
+          EOF
+
+          # Firefox: best-effort system-wide policy (may not apply if Firefox is a snap build).
+          sudo mkdir -p /etc/firefox/policies
+          sudo tee /etc/firefox/policies/policies.json >/dev/null <<'EOF'
+          { "policies": { "ExtensionSettings": { "uBlock0@raymondhill.net": {
+              "installation_mode": "force_installed",
+              "install_url": "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi",
+              "private_browsing": true } } } }
+          EOF
+          echo "Browser policies written."
+
+      # ---------------------------------------------------------------------------
+      - name: Verify Listeners
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo ss -ltn | grep -q ':22 ' || { echo "sshd is not listening on 22." >&2; exit 1; }
+          echo "sshd is listening on 22."
+          echo "SSH host key fingerprint (verify on first connect):"
+          ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+
+      - name: Maintain Connection Until Deadline
+        shell: bash
+        run: |
+          set -u
+          echo ""
+          echo "============ ACCESS ============"
+          echo "SSH:  ssh -o ServerAliveInterval=30 ${REMOTE_USER}@${TAILSCALE_IP}"
+          echo "Admin: run 'sudo <cmd>' and enter the RDP_PASSWORD secret when asked"
+          if [ "$ENABLE_GUI" = "true" ]; then
+            echo "GUI:  RDP client -> ${TAILSCALE_IP}:3389 , user '${REMOTE_USER}', password = RDP_PASSWORD secret"
+          fi
+          echo "Reconnect: just SSH/RDP again any time before the deadline (use 'tmux a' to resume)"
+          echo "Stop early: run 'touch /tmp/stop-session' over SSH"
+          echo "Auto stop UTC: $(date -u -d @"$SESSION_STOP_EPOCH" '+%Y-%m-%d %H:%M:%S')"
+          echo "================================"
+
+          while true; do
+            NOW=$(date -u +%s)
+            REMAINING=$(( SESSION_STOP_EPOCH - NOW ))
+            if [ "$REMAINING" -le 0 ]; then break; fi
+            if [ -f /tmp/stop-session ]; then
+              echo "Stop file detected. Ending session."
+              break
+            fi
+            printf 'Session active. Remaining: %02d:%02d:%02d\n' \
+              $((REMAINING/3600)) $(((REMAINING%3600)/60)) $((REMAINING%60))
+            SLEEP=$(( REMAINING < 30 ? REMAINING : 30 ))
+            sleep "$SLEEP"
+          done
+          echo "Ending workflow."
+
+      # Runs even if an earlier step failed or the job was cancelled.
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          sudo tailscale logout >/dev/null 2>&1 || true
+          sudo systemctl stop xrdp >/dev/null 2>&1 || true
+          sudo systemctl stop ssh >/dev/null 2>&1 || true
+          sudo pkill -KILL -u "$REMOTE_USER" >/dev/null 2>&1 || true
+          sudo userdel -r "$REMOTE_USER" >/dev/null 2>&1 || true
+          sudo rm -f "/etc/sudoers.d/90-$REMOTE_USER"
+          echo "Cleanup complete."
