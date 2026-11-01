@@ -194,7 +194,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-terminal dbus-x11 xorgxrdp xrdp
+            xfce4 xfce4-session xfconf xfce4-terminal dbus-x11 xorgxrdp xrdp
 
           # Keep disconnected desktop sessions alive so you can reconnect to the same session.
           sudo sed -i \
@@ -203,8 +203,19 @@ jobs:
             -e 's/^#\?IdleTimeLimit=.*/IdleTimeLimit=0/' \
             /etc/xrdp/sesman.ini
 
-          echo "xfce4-session" | sudo tee "/home/$REMOTE_USER/.xsession" >/dev/null
+          # XFCE needs its own D-Bus session (xfconfd); without it you get
+          # "Unable to load a failsafe session". dbus-launch provides it.
+          sudo tee "/home/$REMOTE_USER/.xsession" >/dev/null <<'EOF'
+          #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_SESSION_DESKTOP=xfce
+          export XDG_CURRENT_DESKTOP=XFCE
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
           sudo chown "$REMOTE_USER:$REMOTE_USER" "/home/$REMOTE_USER/.xsession"
+          sudo chmod 755 "/home/$REMOTE_USER/.xsession"
           sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
 
           sudo systemctl enable --now xrdp
