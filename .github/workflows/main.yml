@@ -12,7 +12,7 @@ on:
       enable_gui:
         description: "Also install XFCE + xrdp (GUI over RDP via Tailscale)? Adds ~3-5 min."
         required: true
-        default: true
+        default: false
         type: boolean
       allow_ssh_password:
         description: "Also allow SSH password login (in addition to your key)? Tailscale-only either way."
@@ -72,6 +72,11 @@ jobs:
           if ! id "$REMOTE_USER" >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash -G sudo "$REMOTE_USER"
           fi
+          # Let this user run docker without sudo (docker group = root-equivalent, which is
+          # fine here since the user is already an admin). Applies to new logins.
+          getent group docker >/dev/null || sudo groupadd docker
+          sudo usermod -aG docker "$REMOTE_USER"
+
           # Real password: used for sudo (admin) and the xrdp login screen.
           # 'sudo' group membership gives admin rights; sudo will ask for this password.
           echo "$REMOTE_USER:$RDP_PASSWORD" | sudo chpasswd
