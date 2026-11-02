@@ -209,6 +209,11 @@ jobs:
           #!/bin/sh
           unset DBUS_SESSION_BUS_ADDRESS
           unset XDG_RUNTIME_DIR
+          # Runner images set XDG_* to /home/runner/...; use this user's own home instead.
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
           export XDG_CONFIG_DIRS=/etc/xdg
           export XDG_SESSION_DESKTOP=xfce
           export XDG_CURRENT_DESKTOP=XFCE
@@ -216,6 +221,17 @@ jobs:
           EOF
           sudo chown "$REMOTE_USER:$REMOTE_USER" "/home/$REMOTE_USER/.xsession"
           sudo chmod 755 "/home/$REMOTE_USER/.xsession"
+
+          # Same fix for SSH login shells (runner image exports XDG_* for /home/runner).
+          sudo -u "$REMOTE_USER" mkdir -p \
+            "/home/$REMOTE_USER/.config" "/home/$REMOTE_USER/.cache" "/home/$REMOTE_USER/.local/share"
+          sudo tee -a "/home/$REMOTE_USER/.profile" >/dev/null <<'EOF'
+
+          # Runner images set XDG_* to /home/runner; point them at this user instead.
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          EOF
           sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
 
           sudo systemctl enable --now xrdp
