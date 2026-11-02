@@ -215,6 +215,7 @@ jobs:
           export XDG_DATA_HOME="$HOME/.local/share"
           mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
           export XDG_CONFIG_DIRS=/etc/xdg
+          export NO_AT_BRIDGE=1
           export XDG_SESSION_DESKTOP=xfce
           export XDG_CURRENT_DESKTOP=XFCE
           exec dbus-launch --exit-with-session startxfce4
@@ -232,6 +233,14 @@ jobs:
           export XDG_CACHE_HOME="$HOME/.cache"
           export XDG_DATA_HOME="$HOME/.local/share"
           EOF
+          # Edge/Chrome crash with "SUID sandbox helper ... not configured correctly" on
+          # Ubuntu 24.04. Allow the normal user-namespace sandbox (sandbox stays ON) and
+          # make sure the SUID fallback helpers have the right owner/mode.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          for f in /opt/microsoft/msedge/msedge-sandbox /opt/google/chrome/chrome-sandbox; do
+            if [ -f "$f" ]; then sudo chown root:root "$f"; sudo chmod 4755 "$f"; fi
+          done
+
           sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
 
           sudo systemctl enable --now xrdp
@@ -249,6 +258,13 @@ jobs:
           sudo mkdir -p /etc/opt/chrome/policies/managed
           sudo tee /etc/opt/chrome/policies/managed/ublock.json >/dev/null <<'EOF'
           { "ExtensionInstallForcelist": ["ddkjiahejlhfcafbddmgiahcphecmpfh;https://clients2.google.com/service/update2/crx"] }
+          EOF
+
+          # Edge (the runner's default browser): uBlock Origin from the Edge Add-ons store.
+          # Best-effort: extension ID not verified against the live store.
+          sudo mkdir -p /etc/opt/edge/policies/managed
+          sudo tee /etc/opt/edge/policies/managed/ublock.json >/dev/null <<'EOF'
+          { "ExtensionInstallForcelist": ["odfafepnkmbhccpbejgmiehpchacaeak;https://edge.microsoft.com/extensionwebstorebase/v1/crx"] }
           EOF
 
           # Firefox: best-effort system-wide policy (may not apply if Firefox is a snap build).
